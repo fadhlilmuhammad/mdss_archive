@@ -5,6 +5,7 @@
 
 set -euo pipefail
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+USER="${USER:-$(id -un)}"
 
 # ---------- helpers ----------
 ask() { local r; read -r -p "$1 [${2:-}]: " r; echo "${r:-$2}"; }
@@ -71,14 +72,29 @@ do_transfer() {
     for p in "${parts[@]}"; do
         [ -z "$p" ] && continue
         path="${path:+$path/}$p"
-        mdss -P "$PROJ" mk "$path" 2>/dev/null || true
+        mdss -P "$PROJ" mkdir "$path" >/dev/null 2>&1 || true   # errors if it already exists; checked below
     done
+    mdss -P "$PROJ" ls "$DEST" >/dev/null 2>&1 \
+        || die "Could not create or access $PROJ:$DEST on massdata. Local archive kept at $archive"
     mdss -P "$PROJ" put "$archive" "$DEST/"
     mdss -P "$PROJ" ls -l "$DEST/$base"
 
-    # 4. verify by downloading it back and comparing checksums
+    # 4. verify
     local verified=n
-    if [ "$VERIFY" = "y" ]; then
+    case "$VERIFY" in
+      quick)
+        echo ">> [4/5] Verifying on massdata (mdss verify + size check, no download)"
+        local vout rsize
+        vout=$(mdss -P "$PROJ" verify "$DEST/$base" 2>&1) \
+            || die "mdss verify failed: $vout. Nothing deleted. Archive kept at $archive"
+        echo "   $vout"
+        echo "$vout" | grep -qE ':[[:space:]]*OK[[:space:]]*$' \
+            || die "mdss verify did not report OK. Nothing deleted. Archive kept at $archive"
+        rsize=$(mdss -P "$PROJ" ls -l "$DEST/$base" | awk 'NR==1{print $5}')
+        [ "$rsize" = "$lsize" ] \
+            || die "Size mismatch (local=$lsize remote=${rsize:-unknown}). Nothing deleted. Archive kept at $archive"
+        echo "   OK: verify passed and size matches ($(human "$lsize"))"; verified=y ;;
+      full)
         echo ">> [4/5] Verifying: downloading copy back and comparing checksums"
         local vdir="$STAGE/.verify_$$"
         mkdir -p "$vdir"
@@ -89,10 +105,10 @@ do_transfer() {
             echo "   OK: checksums match"; verified=y
         else
             die "CHECKSUM MISMATCH (local=$lsha remote=$rsha). Nothing deleted. Archive kept at $archive"
-        fi
-    else
-        echo ">> [4/5] Verification skipped"
-    fi
+        fi ;;
+      none) echo ">> [4/5] Verification skipped" ;;
+      *)    die "Unknown VERIFY mode '$VERIFY'" ;;
+    esac
 
     # 5. cleanup
     echo ">> [5/5] Cleanup"
@@ -102,7 +118,7 @@ do_transfer() {
         rm -rf -- "$SRC"
         echo "   Deleted original folder: $SRC"
     fi
-    if [ "$DELETE_LOCAL" = "y" ] && [ "$verified" = y ]; then
+    if [ "$DELETE_LOCAL" = "y" ] && { [ "$verified" = y ] || [ "$VERIFY" = none ]; }; then
         rm -f "$archive"
         echo "   Deleted local archive."
     else
@@ -135,15 +151,18 @@ DEST="$(ask "Destination directory on massdata (inside project)" "$USER/$(basena
 echo "Compression:  1) tar.gz   2) tar only (best if data is already compressed, e.g. NetCDF with deflate)"
 case "$(ask "Choose" "1")" in 1) COMP=gz ;; 2) COMP=none ;; *) die "Invalid choice." ;; esac
 
-STAGE="$(ask "Staging directory (needs space for the archive, ~2x briefly during verification)" "/scratch/$PROJ/$USER/mdss_staging")"
+STAGE="$(ask "Staging directory (needs space for the archive; ~2x briefly if you choose full verification)" "/scratch/$PROJ/$USER/mdss_staging")"
 case "$(readlink -f "$STAGE")/" in "$SRC"/*) die "Staging dir can't be inside the source folder." ;; esac
 
 echo
-VERIFY=y
-yesno "Verify by downloading the upload back and comparing checksums? (strongly recommended)" y || VERIFY=n
+echo "How should the upload be verified?"
+echo "  1) quick: mdss verify + size check (no download - fine for huge archives)"
+echo "  2) full:  download back and compare SHA-256 (most thorough, needs time + space)"
+echo "  3) none:  no check; local archive deleted once mdss put succeeds (original folder is never deleted)"
+case "$(ask "Choose" "1")" in 1) VERIFY=quick ;; 2) VERIFY=full ;; 3) VERIFY=none ;; *) die "Invalid choice." ;; esac
 
 DELETE_SRC=n; DELETE_LOCAL=n
-if [ "$VERIFY" = y ]; then
+if [ "$VERIFY" != none ]; then
     if yesno "Delete the ORIGINAL folder if everything verifies?" n; then
         safe_to_delete "$SRC" || die "Refusing: '$SRC' looks like a top-level directory."
         echo "   This permanently deletes: $SRC"
@@ -151,9 +170,9 @@ if [ "$VERIFY" = y ]; then
         [ "$conf" = "$(basename "$SRC")" ] || die "Confirmation did not match. Aborting."
         DELETE_SRC=y
     fi
-    yesno "Delete the local archive file after a verified upload?" y && DELETE_LOCAL=y
+    DELETE_LOCAL=y   # local archive is always removed once the checksum check passes
 else
-    echo "   (Original/local deletion is disabled when verification is skipped.)"
+    echo "   (Original deletion is disabled when verification is skipped.)"
 fi
 
 echo
